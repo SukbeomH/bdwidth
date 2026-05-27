@@ -127,10 +127,18 @@ for example: [bdwidth fila_width_0] in the printer.cfg then we can run this comm
 > for example:SET_BDWIDTH NAME=fila_width_0 COMMAND=ENABLE
 
 
-#### [Discord](https://discord.gg/f2V2vTzX)
-#### Wiki:https://pandapi3d.cn/
-#### My store: [https://www.pandapi3d.com](https://www.pandapi3d.com)
+
 #### [Test Video1](https://www.youtube.com/watch?v=Cj5bzoDzowE)  , [Test Video2](https://www.youtube.com/watch?v=vu5LtXh5HZw) 
 [Test Video3](https://www.tiktok.com/@plumpkatt1/video/7567149596976090381?is_from_webapp=1&sender_device=pc&web_id=7567204802599994898)
+
+## Community & Support
+ 
+| Channel | Link |
+|---|---|
+| Discord | [discord.gg/z6ahddnGVU](https://discord.gg/z6ahddnGVU) |
+| Facebook group | [facebook.com/groups/380795976169477](https://facebook.com/groups/380795976169477) |
+| Thingiverse | [thingiverse](https://thingiverse.com) |
+| Where to buy | [fabreeko.com](https://fabreeko.com) <br> [west3d.com](https://west3d.com)  <br> [pandapi3d.com](https://pandapi3d.com) , [淘宝](https://shop62248922.taobao.com/)
+|
 
 
