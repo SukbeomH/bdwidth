@@ -202,11 +202,31 @@ class BDWidthCCDHelperTest(unittest.TestCase):
         self.assertFalse(bdwidth.is_ccd_snapshot_outlier(2.0, 1.5, 2.0))
         self.assertTrue(bdwidth.is_ccd_snapshot_outlier(2.001, 1.5, 2.0))
 
+    def test_read_bdwidth_suppresses_invalid_frame_console_output_by_default(self):
+        bdwidth = load_bdwidth_module()
+        sensor = make_bdwidth_sensor(
+            bdwidth, FakeSerial([b"\x00\x00\x00\x00\x00"]), is_debug=False)
+
+        self.assertFalse(sensor.Read_bdwidth())
+        self.assertEqual(sensor.gcode.messages, [])
+
+    def test_read_bdwidth_reports_invalid_frame_when_debug_enabled(self):
+        bdwidth = load_bdwidth_module()
+        sensor = make_bdwidth_sensor(
+            bdwidth, FakeSerial([b"\x04\x0a\x05\x0a\x02"]), is_debug=True)
+
+        self.assertFalse(sensor.Read_bdwidth())
+        self.assertEqual(
+            sensor.gcode.messages,
+            ["4", "10", "5", "10", "2", "fila_width_0: read data error"])
+
 
 class FakeSerial:
     def __init__(self, chunks):
         self.chunks = list(chunks)
         self.writes = []
+        self.is_open = True
+        self.timeout = None
 
     def write(self, data):
         self.writes.append(data)
@@ -218,6 +238,25 @@ class FakeSerial:
 
     def reset_input_buffer(self):
         pass
+
+
+class FakeGCode:
+    def __init__(self):
+        self.messages = []
+
+    def respond_info(self, message):
+        self.messages.append(message)
+
+
+def make_bdwidth_sensor(bdwidth, serial, is_debug=False):
+    sensor = object.__new__(bdwidth.BDWidthMotionSensor)
+    sensor.port = "usb"
+    sensor.usb = serial
+    sensor.usb_lock = None
+    sensor.gcode = FakeGCode()
+    sensor.bd_name = "fila_width_0"
+    sensor.is_debug = is_debug
+    return sensor
 
 
 if __name__ == "__main__":
