@@ -97,7 +97,8 @@ def is_ccd_snapshot_outlier(width, min_width, max_width):
     return width < min_width or width > max_width
 
 
-def write_ccd_snapshot_files(outdir, stamp, frames, raw_bytes, metadata=None):
+def write_ccd_snapshot_files(outdir, stamp, frames, raw_bytes, metadata=None,
+                             render_png=True):
     if not frames:
         raise ValueError("no CCD frames to save")
     outdir = os.path.abspath(os.path.expanduser(outdir))
@@ -126,14 +127,49 @@ def write_ccd_snapshot_files(outdir, stamp, frames, raw_bytes, metadata=None):
         "png": png_path,
         "csv": csv_path,
         "raw": raw_path,
+        "png_rendered": bool(render_png),
     })
-    with open(json_path, "w") as f:
-        json.dump(snapshot_metadata, f, indent=2, sort_keys=True)
 
-    write_ccd_plot_png(png_path, frame)
+    if render_png:
+        write_ccd_plot_png(png_path, frame)
 
     snapshot_metadata["json"] = json_path
+    with open(json_path, "w") as f:
+        json.dump(snapshot_metadata, f, indent=2, sort_keys=True)
     return snapshot_metadata
+
+
+def render_deferred_ccd_png(json_path):
+    json_path = os.path.abspath(os.path.expanduser(json_path))
+    with open(json_path) as f:
+        metadata = json.load(f)
+    if metadata.get("png_rendered"):
+        return False
+    csv_path = metadata["csv"]
+    png_path = metadata["png"]
+    frame = []
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            frame.append(int(row["amplitude"]))
+    if not frame:
+        return False
+    write_ccd_plot_png(png_path, frame)
+    metadata["png_rendered"] = True
+    metadata["png_rendered_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(json_path, "w") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+    return True
+
+
+def render_deferred_ccd_pngs(json_paths, limit=1):
+    rendered = []
+    for json_path in list(json_paths):
+        if len(rendered) >= limit:
+            break
+        if render_deferred_ccd_png(json_path):
+            rendered.append(json_path)
+    return rendered
 
 
 def write_ccd_plot_png(png_path, frame):
@@ -422,9 +458,17 @@ class BDWidthMotionSensor:
             'ccd_snapshot_frames', 3., above=0.))
         self.ccd_snapshot_timeout = config.getfloat(
             'ccd_snapshot_timeout', 2., above=0.)
+        self.ccd_snapshot_defer_png_during_print = config.getboolean(
+            'ccd_snapshot_defer_png_during_print', True)
+        self.ccd_snapshot_png_limit_per_print = config.getint(
+            'ccd_snapshot_png_limit_per_print', 1, minval=0)
         self.ccd_snapshot_in_progress = False
         self.ccd_snapshot_last_capture_time = 0.
         self.ccd_snapshot_thread = None
+        self.ccd_snapshot_is_printing = False
+        self.ccd_snapshot_pending_pngs = []
+        self.ccd_snapshot_pending_lock = threading.Lock()
+        self.ccd_snapshot_render_in_progress = False
         self.sample_time=config.getfloat('sample_time', 1.0) # in second
         self.is_log =config.getboolean('logging', False)
         self.is_debug =config.getboolean('debug_info', False)
@@ -457,6 +501,8 @@ class BDWidthMotionSensor:
                                             self._handle_ready)
         self.printer.register_event_handler("klippy:shutdown", self._shutdown)
         
+        self.printer.register_event_handler('idle_timeout:printing',
+                                            self._handle_printing)
         self.printer.register_event_handler('idle_timeout:ready',
                                             self._handle_not_printing)
         self.printer.register_event_handler('idle_timeout:idle',
@@ -585,16 +631,59 @@ class BDWidthMotionSensor:
                     "%s: CCD snapshot captured no valid frames raw_bytes=%d"
                     % (self.bd_name, len(result["raw"])))
                 return
+            render_png = True
+            if (self.ccd_snapshot_defer_png_during_print
+                and self.ccd_snapshot_is_printing):
+                render_png = False
             saved = write_ccd_snapshot_files(
                 self.ccd_snapshot_dir, stamp, result["frames"], result["raw"],
-                metadata)
-            logging.info("%s: saved CCD snapshot png=%s csv=%s json=%s"
-                         % (self.bd_name, saved["png"], saved["csv"],
-                            saved["json"]))
+                metadata, render_png=render_png)
+            if render_png:
+                logging.info("%s: saved CCD snapshot png=%s csv=%s json=%s"
+                             % (self.bd_name, saved["png"], saved["csv"],
+                                saved["json"]))
+            else:
+                with self.ccd_snapshot_pending_lock:
+                    self.ccd_snapshot_pending_pngs.append(saved["json"])
+                logging.info(
+                    "%s: saved CCD snapshot data for deferred png csv=%s json=%s"
+                    % (self.bd_name, saved["csv"], saved["json"]))
         except Exception:
             logging.exception("%s: CCD snapshot failed" % self.bd_name)
         finally:
             self.ccd_snapshot_in_progress = False
+
+    def _queue_deferred_ccd_png_render(self):
+        if self.ccd_snapshot_render_in_progress:
+            return
+        with self.ccd_snapshot_pending_lock:
+            if not self.ccd_snapshot_pending_pngs:
+                return
+            pending = self.ccd_snapshot_pending_pngs[
+                :self.ccd_snapshot_png_limit_per_print]
+            self.ccd_snapshot_pending_pngs = []
+        if not pending:
+            return
+        self.ccd_snapshot_render_in_progress = True
+        thread = threading.Thread(
+            target=self._render_deferred_ccd_png_worker,
+            args=(pending,),
+            name="bdwidth-ccd-png-render",
+            daemon=True)
+        thread.start()
+
+    def _render_deferred_ccd_png_worker(self, json_paths):
+        try:
+            rendered = render_deferred_ccd_pngs(
+                json_paths, limit=self.ccd_snapshot_png_limit_per_print)
+            if rendered:
+                logging.info("%s: rendered deferred CCD png from %s"
+                             % (self.bd_name, rendered[0]))
+        except Exception:
+            logging.exception("%s: deferred CCD png render failed"
+                              % self.bd_name)
+        finally:
+            self.ccd_snapshot_render_in_progress = False
 
     
     def update_filament_array(self, last_epos):
@@ -831,7 +920,12 @@ class BDWidthMotionSensor:
     def _shutdown(self):
         self.reactor.update_timer(self.extrude_factor_update_timer,  
                                   self.reactor.NEVER)      
+    def _handle_printing(self, print_time):
+        self.ccd_snapshot_is_printing = True
+
     def _handle_not_printing(self, print_time):
+        self.ccd_snapshot_is_printing = False
+        self._queue_deferred_ccd_png_render()
 
         return
 

@@ -94,6 +94,61 @@ class BDWidthCCDHelperTest(unittest.TestCase):
             self.assertEqual(saved_metadata["samples"], 2547)
             self.assertEqual(saved_metadata["min"], 420)
             self.assertEqual(saved_metadata["max"], 2500)
+            self.assertTrue(saved_metadata["png_rendered"])
+
+    def test_write_ccd_snapshot_files_can_defer_png_rendering(self):
+        bdwidth = load_bdwidth_module()
+        frame = [2500] * 2547
+        frame[1200] = 420
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = bdwidth.write_ccd_snapshot_files(
+                tmpdir, "20260701_021501", [frame], b"raw-bytes",
+                {"reason": "outlier_width"}, render_png=False)
+
+            self.assertFalse(Path(result["png"]).exists())
+            self.assertTrue(Path(result["csv"]).exists())
+            self.assertTrue(Path(result["raw"]).exists())
+            self.assertTrue(Path(result["json"]).exists())
+            with open(result["json"]) as f:
+                saved_metadata = json.load(f)
+            self.assertFalse(saved_metadata["png_rendered"])
+
+    def test_render_deferred_ccd_png_creates_png_once_from_json_and_csv(self):
+        bdwidth = load_bdwidth_module()
+        frame = [2500] * 2547
+        frame[1200] = 420
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = bdwidth.write_ccd_snapshot_files(
+                tmpdir, "20260701_021502", [frame], b"raw-bytes",
+                {"reason": "outlier_width"}, render_png=False)
+
+            self.assertTrue(bdwidth.render_deferred_ccd_png(result["json"]))
+            self.assertTrue(Path(result["png"]).exists())
+            with open(result["json"]) as f:
+                saved_metadata = json.load(f)
+            self.assertTrue(saved_metadata["png_rendered"])
+            self.assertFalse(bdwidth.render_deferred_ccd_png(result["json"]))
+
+    def test_render_deferred_ccd_pngs_respects_limit(self):
+        bdwidth = load_bdwidth_module()
+        frame = [2500] * 2547
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = bdwidth.write_ccd_snapshot_files(
+                tmpdir, "20260701_021503", [frame], b"raw-1",
+                {"reason": "outlier_width"}, render_png=False)
+            second = bdwidth.write_ccd_snapshot_files(
+                tmpdir, "20260701_021504", [frame], b"raw-2",
+                {"reason": "outlier_width"}, render_png=False)
+
+            rendered = bdwidth.render_deferred_ccd_pngs(
+                [first["json"], second["json"]], limit=1)
+
+            self.assertEqual(rendered, [first["json"]])
+            self.assertTrue(Path(first["png"]).exists())
+            self.assertFalse(Path(second["png"]).exists())
 
     def test_capture_ccd_snapshot_from_serial_enters_and_exits_stream_mode(self):
         bdwidth = load_bdwidth_module()
