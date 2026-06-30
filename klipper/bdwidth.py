@@ -403,9 +403,9 @@ class BDWidthMotionSensor:
         self.linear_motion=config.getfloat('motion_linear_coefficient', 42.8)
         self.max_diameter=config.getfloat('max_diameter', 1.9)
         self.min_plausible_diameter = config.getfloat(
-            'min_plausible_diameter', 0.5, above=0.)
+            'min_plausible_diameter', 1.5, above=0.)
         self.max_plausible_diameter = config.getfloat(
-            'max_plausible_diameter', 3.0,
+            'max_plausible_diameter', 2.0,
             above=self.min_plausible_diameter)
         self.ccd_snapshot_on_outlier = config.getboolean(
             'ccd_snapshot_on_outlier', False)
