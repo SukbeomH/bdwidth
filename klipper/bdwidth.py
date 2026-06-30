@@ -268,7 +268,7 @@ class BDWidthMotionSensor:
             self.cmd_query(gcmd)  
     def get_logger(self,name):
         logger = logging.getLogger(self.bd_name)
-        log_path = os.path.abspath(name)
+        log_path = os.path.abspath(os.path.expanduser(name))
         formatter = logging.Formatter('%(asctime)s,%(message)s',"%m/%d %H:%M:%S")
         logger.setLevel(logging.DEBUG)
         logger.propagate = False
