@@ -190,6 +190,11 @@ class BDWidthMotionSensor:
         self.min_diameter=config.getfloat('min_diameter', 1.0)
         self.linear_motion=config.getfloat('motion_linear_coefficient', 42.8)
         self.max_diameter=config.getfloat('max_diameter', 1.9)
+        self.min_plausible_diameter = config.getfloat(
+            'min_plausible_diameter', 0.5, above=0.)
+        self.max_plausible_diameter = config.getfloat(
+            'max_plausible_diameter', 3.0,
+            above=self.min_plausible_diameter)
         self.sample_time=config.getfloat('sample_time', 1.0) # in second
         self.is_log =config.getboolean('logging', False)
         self.is_debug =config.getboolean('debug_info', False)
@@ -263,16 +268,17 @@ class BDWidthMotionSensor:
             self.cmd_query(gcmd)  
     def get_logger(self,name):
         logger = logging.getLogger(self.bd_name)
-        fh = logging.FileHandler(name, mode='a+', encoding='utf-8')
-        ch = logging.StreamHandler()
+        log_path = os.path.abspath(name)
         formatter = logging.Formatter('%(asctime)s,%(message)s',"%m/%d %H:%M:%S")
         logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        for handler in logger.handlers:
+            if (isinstance(handler, logging.FileHandler)
+                and os.path.abspath(handler.baseFilename) == log_path):
+                return logger
+        fh = logging.FileHandler(log_path, mode='a+', encoding='utf-8')
         fh.setFormatter(formatter)
-        ch.setFormatter(formatter)
         logger.addHandler(fh)
-        logger.addHandler(ch)
-
-        logger.removeHandler(ch)
         return logger
 
 
@@ -318,6 +324,10 @@ class BDWidthMotionSensor:
         buffer = bytearray()
         if "usb" == self.port:
             if self.usb.is_open:
+                try:
+                    self.usb.reset_input_buffer()
+                except Exception:
+                    pass
                 self.usb.write('\n'.encode())
                 self.usb.timeout = 0.01
                 data = self.usb.read(5)
@@ -326,14 +336,24 @@ class BDWidthMotionSensor:
                         buffer.append(byte)
         elif "i2c" == self.port: 
             buffer = self.read_register('_measure_data', 5)
-        if len(buffer) >= 5 and b'\x0a' in buffer:
-            self.raw_width = ((buffer[1] << 8) + buffer[0])&0xffff
-            self.lastMotionReading = ((buffer[3] << 8) + buffer[2])&0xffff
-            if self.lastMotionReading>32767 :
-                self.lastMotionReading = self.lastMotionReading - 65535
-            self.lastMotionReading = -self.lastMotionReading # change the default dir
+        if len(buffer) == 5 and buffer[4] == 0x0a:
+            raw_width = ((buffer[1] << 8) + buffer[0])&0xffff
+            lastMotionReading = ((buffer[3] << 8) + buffer[2])&0xffff
+            if lastMotionReading>32767 :
+                lastMotionReading = lastMotionReading - 65536
+            lastMotionReading = -lastMotionReading # change the default dir
+            filament_width = raw_width*0.00525
+            if (filament_width < self.min_plausible_diameter
+                or filament_width > self.max_plausible_diameter):
+                self.gcode.respond_info(
+                    "%s: ignored implausible width frame: %.3fmm raw:%d motion:%d"
+                    % (self.bd_name, filament_width, raw_width,
+                       lastMotionReading))
+                return False
             
-            self.lastFilamentWidthReading = self.raw_width*0.00525
+            self.raw_width = raw_width
+            self.lastMotionReading = lastMotionReading
+            self.lastFilamentWidthReading = filament_width
             self.actual_total_move = self.actual_total_move + self.lastMotionReading
             if self.lastMotionReading !=0:
                 if self.is_debug == True:
