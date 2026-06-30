@@ -1,6 +1,11 @@
 import logging
+import csv
+import json
 import math
+import struct
 import statistics
+import threading
+import zlib
 import serial
 import serial.tools.list_ports
 import os
@@ -23,6 +28,211 @@ BDWIDTH_VERSION_MARKER = 'pandapi3dV'   # capital V  = bdwidth
 # CH340/CH341 USB-serial chips  vendor ID 1A86 (QinHeng Electronics)
 CH340_VID = 0x1A86
 CH340_KEYWORDS = ('ch340', 'ch341', '1a86', 'qinheng')
+CCD_FRAME_TERMINATOR = b'\xff\xff'
+CCD_MIN_SAMPLES = 2540
+CCD_MAX_SAMPLES = 2600
+CCD_MAX_AMPLITUDE = 4096
+
+
+def decode_ccd_frames(raw_bytes, min_samples=CCD_MIN_SAMPLES,
+                      max_samples=CCD_MAX_SAMPLES,
+                      max_amplitude=CCD_MAX_AMPLITUDE):
+    buffer = bytearray(raw_bytes)
+    frames = []
+    while True:
+        frame_end = buffer.find(CCD_FRAME_TERMINATOR)
+        if frame_end < 0:
+            break
+        packet = bytes(buffer[:frame_end])
+        del buffer[:frame_end + len(CCD_FRAME_TERMINATOR)]
+        if len(packet) % 2:
+            packet = packet[:-1]
+        values = []
+        for i in range(0, len(packet), 2):
+            value = ((packet[i + 1] << 8) + packet[i]) & 0xffff
+            if value > max_amplitude:
+                value = max_amplitude
+            values.append(value)
+        if len(values) > min_samples and len(values) < max_samples:
+            frames.append(values)
+    return frames
+
+
+def capture_ccd_snapshot_from_serial(ser, frame_count=3, timeout=2.0,
+                                     read_size=4096):
+    raw = bytearray()
+    frames = []
+    try:
+        try:
+            ser.reset_input_buffer()
+        except Exception:
+            pass
+        ser.write(b"D01;")
+        deadline = time.time() + timeout
+        while time.time() < deadline and len(frames) < frame_count:
+            chunk = ser.read(read_size)
+            if chunk:
+                raw.extend(chunk)
+                frames = decode_ccd_frames(bytes(raw))
+            else:
+                time.sleep(0.01)
+    finally:
+        try:
+            ser.write(b"G00;")
+        except Exception:
+            pass
+    if len(frames) > frame_count:
+        frames = frames[-frame_count:]
+    return {"frames": frames, "raw": bytes(raw)}
+
+
+def should_start_ccd_snapshot(enabled, in_progress, last_capture_time, now,
+                              min_interval):
+    if not enabled or in_progress:
+        return False
+    return now - last_capture_time >= min_interval
+
+
+def is_ccd_snapshot_outlier(width, min_width, max_width):
+    return width < min_width or width > max_width
+
+
+def write_ccd_snapshot_files(outdir, stamp, frames, raw_bytes, metadata=None):
+    if not frames:
+        raise ValueError("no CCD frames to save")
+    outdir = os.path.abspath(os.path.expanduser(outdir))
+    os.makedirs(outdir, exist_ok=True)
+    base = os.path.join(outdir, "ccd_%s" % stamp)
+    png_path = base + ".png"
+    csv_path = base + ".csv"
+    raw_path = base + ".raw"
+    json_path = base + ".json"
+    frame = frames[-1]
+
+    with open(raw_path, "wb") as f:
+        f.write(raw_bytes)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["index", "amplitude"])
+        writer.writerows(enumerate(frame))
+
+    snapshot_metadata = dict(metadata or {})
+    snapshot_metadata.update({
+        "frames": len(frames),
+        "samples": len(frame),
+        "min": min(frame),
+        "max": max(frame),
+        "mean": statistics.mean(frame),
+        "png": png_path,
+        "csv": csv_path,
+        "raw": raw_path,
+    })
+    with open(json_path, "w") as f:
+        json.dump(snapshot_metadata, f, indent=2, sort_keys=True)
+
+    write_ccd_plot_png(png_path, frame)
+
+    snapshot_metadata["json"] = json_path
+    return snapshot_metadata
+
+
+def write_ccd_plot_png(png_path, frame):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(14, 6), dpi=120)
+        ax.plot(range(len(frame)), frame, "b-", linewidth=0.8)
+        ax.set_title("BDWidth CCD pixel amplitude vs index")
+        ax.set_xlabel("index")
+        ax.set_ylabel("amplitude")
+        ax.set_ylim(0, CCD_MAX_AMPLITUDE)
+        ax.grid(True, linewidth=0.3, alpha=0.5)
+        fig.tight_layout()
+        fig.savefig(png_path)
+        plt.close(fig)
+        return
+    except ImportError:
+        pass
+    write_simple_ccd_png(png_path, frame)
+
+
+def write_simple_ccd_png(png_path, frame, width=1400, height=600):
+    margin_left = 48
+    margin_right = 18
+    margin_top = 18
+    margin_bottom = 42
+    plot_w = width - margin_left - margin_right
+    plot_h = height - margin_top - margin_bottom
+    pixels = bytearray([255] * width * height * 3)
+
+    def set_pixel(x, y, color):
+        if x < 0 or x >= width or y < 0 or y >= height:
+            return
+        offset = (y * width + x) * 3
+        pixels[offset:offset + 3] = bytes(color)
+
+    def draw_line(x0, y0, x1, y1, color):
+        dx = abs(x1 - x0)
+        sx = 1 if x0 < x1 else -1
+        dy = -abs(y1 - y0)
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            set_pixel(x0, y0, color)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+
+    axis_color = (80, 80, 80)
+    grid_color = (230, 230, 230)
+    line_color = (0, 0, 255)
+    for n in range(0, 5):
+        y = margin_top + int(plot_h * n / 4.0)
+        draw_line(margin_left, y, width - margin_right, y, grid_color)
+    for n in range(0, 6):
+        x = margin_left + int(plot_w * n / 5.0)
+        draw_line(x, margin_top, x, height - margin_bottom, grid_color)
+    draw_line(margin_left, margin_top, margin_left, height - margin_bottom,
+              axis_color)
+    draw_line(margin_left, height - margin_bottom, width - margin_right,
+              height - margin_bottom, axis_color)
+
+    if len(frame) > 1:
+        last_x = margin_left
+        last_y = height - margin_bottom - int(
+            max(0, min(CCD_MAX_AMPLITUDE, frame[0]))
+            / float(CCD_MAX_AMPLITUDE) * plot_h)
+        for i, value in enumerate(frame[1:], start=1):
+            x = margin_left + int(i / float(len(frame) - 1) * plot_w)
+            y = height - margin_bottom - int(
+                max(0, min(CCD_MAX_AMPLITUDE, value))
+                / float(CCD_MAX_AMPLITUDE) * plot_h)
+            draw_line(last_x, last_y, x, y, line_color)
+            last_x, last_y = x, y
+
+    def png_chunk(chunk_type, data):
+        return (struct.pack(">I", len(data)) + chunk_type + data
+                + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xffffffff))
+
+    raw_rows = bytearray()
+    stride = width * 3
+    for y in range(height):
+        raw_rows.append(0)
+        raw_rows.extend(pixels[y * stride:(y + 1) * stride])
+    png = bytearray(b"\x89PNG\r\n\x1a\n")
+    png.extend(png_chunk(b"IHDR", struct.pack(">IIBBBBB",
+                                              width, height, 8, 2, 0, 0, 0)))
+    png.extend(png_chunk(b"IDAT", zlib.compress(bytes(raw_rows), 9)))
+    png.extend(png_chunk(b"IEND", b""))
+    with open(png_path, "wb") as f:
+        f.write(png)
 
 
 def _list_all_serial_ports():
@@ -145,6 +355,7 @@ class BDWidthMotionSensor:
         # if config.get("resistance1", None) is None:
         if "i2c" in self.port:  
             self.i2c = bus.MCU_I2C_from_config(config, BDWIDTH_CHIP_ADDR, BDWIDTH_I2C_SPEED)
+            self.usb_lock = None
         elif "usb" in self.port:
             baudrate = 500000
             configured_serial = config.get("serial", None)
@@ -162,6 +373,7 @@ class BDWidthMotionSensor:
                 usb_port = configured_serial
             self.usb_port = usb_port
             self.usb = serial.Serial(self.usb_port, baudrate, timeout=1)
+            self.usb_lock = threading.Lock()
         self.gcode = self.printer.lookup_object('gcode')
         self.extruder_name = config.get('extruder')
         self.check_on_print_start = config.getboolean(
@@ -195,6 +407,24 @@ class BDWidthMotionSensor:
         self.max_plausible_diameter = config.getfloat(
             'max_plausible_diameter', 3.0,
             above=self.min_plausible_diameter)
+        self.ccd_snapshot_on_outlier = config.getboolean(
+            'ccd_snapshot_on_outlier', False)
+        self.ccd_snapshot_min_diameter = config.getfloat(
+            'ccd_snapshot_min_diameter', 1.5)
+        self.ccd_snapshot_max_diameter = config.getfloat(
+            'ccd_snapshot_max_diameter', 2.0,
+            above=self.ccd_snapshot_min_diameter)
+        self.ccd_snapshot_dir = config.get(
+            'ccd_snapshot_dir', self.get_log_path()+"bdwidth_ccd_auto")
+        self.ccd_snapshot_min_interval = config.getfloat(
+            'ccd_snapshot_min_interval', 600., minval=0.)
+        self.ccd_snapshot_frames = int(config.getfloat(
+            'ccd_snapshot_frames', 3., above=0.))
+        self.ccd_snapshot_timeout = config.getfloat(
+            'ccd_snapshot_timeout', 2., above=0.)
+        self.ccd_snapshot_in_progress = False
+        self.ccd_snapshot_last_capture_time = 0.
+        self.ccd_snapshot_thread = None
         self.sample_time=config.getfloat('sample_time', 1.0) # in second
         self.is_log =config.getboolean('logging', False)
         self.is_debug =config.getboolean('debug_info', False)
@@ -298,6 +528,74 @@ class BDWidthMotionSensor:
         if self.is_log == True:
             self.logerb.info(mes_str)
 
+    def _queue_ccd_snapshot(self, reason, filament_width, raw_width, motion):
+        if "usb" != self.port:
+            return
+        now = time.time()
+        if not should_start_ccd_snapshot(
+            self.ccd_snapshot_on_outlier,
+            self.ccd_snapshot_in_progress,
+            self.ccd_snapshot_last_capture_time,
+            now,
+            self.ccd_snapshot_min_interval):
+            return
+        self.ccd_snapshot_in_progress = True
+        self.ccd_snapshot_last_capture_time = now
+        metadata = {
+            "reason": reason,
+            "bd_name": self.bd_name,
+            "width": filament_width,
+            "raw_width": raw_width,
+            "motion": motion,
+            "trigger_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            self.ccd_snapshot_thread = threading.Thread(
+                target=self._capture_ccd_snapshot_worker,
+                args=(metadata,),
+                name="bdwidth-ccd-snapshot",
+                daemon=True)
+            self.ccd_snapshot_thread.start()
+            logging.info("%s: queued CCD snapshot for %s width=%.3f raw=%d"
+                         % (self.bd_name, reason, filament_width, raw_width))
+        except Exception:
+            self.ccd_snapshot_in_progress = False
+            logging.exception("%s: failed to queue CCD snapshot" % self.bd_name)
+
+    def _capture_ccd_snapshot_worker(self, metadata):
+        try:
+            if self.usb_lock is None:
+                return
+            with self.usb_lock:
+                old_timeout = getattr(self.usb, "timeout", None)
+                try:
+                    self.usb.timeout = 0.05
+                    result = capture_ccd_snapshot_from_serial(
+                        self.usb,
+                        frame_count=self.ccd_snapshot_frames,
+                        timeout=self.ccd_snapshot_timeout)
+                finally:
+                    try:
+                        self.usb.timeout = old_timeout
+                    except Exception:
+                        pass
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            if not result["frames"]:
+                logging.warning(
+                    "%s: CCD snapshot captured no valid frames raw_bytes=%d"
+                    % (self.bd_name, len(result["raw"])))
+                return
+            saved = write_ccd_snapshot_files(
+                self.ccd_snapshot_dir, stamp, result["frames"], result["raw"],
+                metadata)
+            logging.info("%s: saved CCD snapshot png=%s csv=%s json=%s"
+                         % (self.bd_name, saved["png"], saved["csv"],
+                            saved["json"]))
+        except Exception:
+            logging.exception("%s: CCD snapshot failed" % self.bd_name)
+        finally:
+            self.ccd_snapshot_in_progress = False
+
     
     def update_filament_array(self, last_epos):
         # Fill array
@@ -323,17 +621,26 @@ class BDWidthMotionSensor:
          
         buffer = bytearray()
         if "usb" == self.port:
-            if self.usb.is_open:
-                try:
-                    self.usb.reset_input_buffer()
-                except Exception:
-                    pass
-                self.usb.write('\n'.encode())
-                self.usb.timeout = 0.01
-                data = self.usb.read(5)
-                if data:
-                    for byte in data:
-                        buffer.append(byte)
+            locked = False
+            if self.usb_lock is not None:
+                locked = self.usb_lock.acquire(False)
+                if not locked:
+                    return False
+            try:
+                if self.usb.is_open:
+                    try:
+                        self.usb.reset_input_buffer()
+                    except Exception:
+                        pass
+                    self.usb.write('\n'.encode())
+                    self.usb.timeout = 0.01
+                    data = self.usb.read(5)
+                    if data:
+                        for byte in data:
+                            buffer.append(byte)
+            finally:
+                if locked:
+                    self.usb_lock.release()
         elif "i2c" == self.port: 
             buffer = self.read_register('_measure_data', 5)
         if len(buffer) == 5 and buffer[4] == 0x0a:
@@ -343,6 +650,15 @@ class BDWidthMotionSensor:
                 lastMotionReading = lastMotionReading - 65536
             lastMotionReading = -lastMotionReading # change the default dir
             filament_width = raw_width*0.00525
+            if is_ccd_snapshot_outlier(
+                filament_width, self.ccd_snapshot_min_diameter,
+                self.ccd_snapshot_max_diameter):
+                reason = "implausible_width"
+                if (filament_width >= self.min_plausible_diameter
+                    and filament_width <= self.max_plausible_diameter):
+                    reason = "outlier_width"
+                self._queue_ccd_snapshot(reason, filament_width, raw_width,
+                                         lastMotionReading)
             if (filament_width < self.min_plausible_diameter
                 or filament_width > self.max_plausible_diameter):
                 self.gcode.respond_info(

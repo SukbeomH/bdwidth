@@ -1,0 +1,169 @@
+import csv
+import importlib.util
+import json
+import sys
+import tempfile
+import types
+from pathlib import Path
+import unittest
+
+
+def load_bdwidth_module():
+    repo_root = Path(__file__).resolve().parents[1]
+    module_path = repo_root / "klipper" / "bdwidth.py"
+    package = types.ModuleType("klipper")
+    package.__path__ = [str(module_path.parent)]
+    sys.modules.setdefault("klipper", package)
+    sys.modules.setdefault("klipper.bus", types.ModuleType("klipper.bus"))
+    fake_serial = types.ModuleType("serial")
+    fake_serial.Serial = object
+    fake_tools = types.ModuleType("serial.tools")
+    fake_list_ports = types.ModuleType("serial.tools.list_ports")
+    fake_list_ports.comports = lambda: []
+    fake_tools.list_ports = fake_list_ports
+    fake_serial.tools = fake_tools
+    sys.modules.setdefault("serial", fake_serial)
+    sys.modules.setdefault("serial.tools", fake_tools)
+    sys.modules.setdefault("serial.tools.list_ports", fake_list_ports)
+    fake_sensor = types.ModuleType("klipper.filament_switch_sensor")
+    fake_sensor.RunoutHelper = object
+    sys.modules.setdefault("klipper.filament_switch_sensor", fake_sensor)
+    spec = importlib.util.spec_from_file_location("klipper.bdwidth", module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["klipper.bdwidth"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def ccd_packet(values):
+    packet = bytearray()
+    for value in values:
+        packet.append(value & 0xff)
+        packet.append((value >> 8) & 0xff)
+    packet.extend(b"\xff\xff")
+    return bytes(packet)
+
+
+class BDWidthCCDHelperTest(unittest.TestCase):
+    def test_decode_ccd_frames_accepts_valid_frame_and_clips_adc_glitches(self):
+        bdwidth = load_bdwidth_module()
+        values = [2500] * 2547
+        values[100] = 5000
+        values[1200] = 420
+
+        frames = bdwidth.decode_ccd_frames(ccd_packet(values))
+
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(len(frames[0]), 2547)
+        self.assertEqual(frames[0][100], 4096)
+        self.assertEqual(frames[0][1200], 420)
+
+    def test_decode_ccd_frames_rejects_short_frames(self):
+        bdwidth = load_bdwidth_module()
+
+        frames = bdwidth.decode_ccd_frames(ccd_packet([1234] * 100))
+
+        self.assertEqual(frames, [])
+
+    def test_write_ccd_snapshot_files_persists_png_csv_raw_and_metadata(self):
+        bdwidth = load_bdwidth_module()
+        frame = [2500] * 2547
+        frame[1200] = 420
+        metadata = {
+            "reason": "implausible_width",
+            "width": 336.851,
+            "raw_width": 64162,
+            "motion": -9072,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = bdwidth.write_ccd_snapshot_files(
+                tmpdir, "20260701_021500", [frame], b"raw-bytes", metadata)
+
+            for key in ("png", "csv", "raw", "json"):
+                self.assertTrue(Path(result[key]).exists(), key)
+
+            with open(result["csv"], newline="") as f:
+                rows = list(csv.reader(f))
+            self.assertEqual(rows[0], ["index", "amplitude"])
+            self.assertEqual(rows[1201], ["1200", "420"])
+
+            with open(result["json"]) as f:
+                saved_metadata = json.load(f)
+            self.assertEqual(saved_metadata["reason"], "implausible_width")
+            self.assertEqual(saved_metadata["samples"], 2547)
+            self.assertEqual(saved_metadata["min"], 420)
+            self.assertEqual(saved_metadata["max"], 2500)
+
+    def test_capture_ccd_snapshot_from_serial_enters_and_exits_stream_mode(self):
+        bdwidth = load_bdwidth_module()
+        values = [2500] * 2547
+        values[1000] = 430
+        fake_serial = FakeSerial([ccd_packet(values)])
+
+        result = bdwidth.capture_ccd_snapshot_from_serial(
+            fake_serial, frame_count=1, timeout=1.0)
+
+        self.assertEqual(fake_serial.writes[0], b"D01;")
+        self.assertEqual(fake_serial.writes[-1], b"G00;")
+        self.assertEqual(len(result["frames"]), 1)
+        self.assertEqual(result["frames"][0][1000], 430)
+        self.assertGreater(len(result["raw"]), 5000)
+
+    def test_capture_ccd_snapshot_from_serial_exits_stream_mode_without_frames(self):
+        bdwidth = load_bdwidth_module()
+        fake_serial = FakeSerial([b"noise"])
+
+        result = bdwidth.capture_ccd_snapshot_from_serial(
+            fake_serial, frame_count=1, timeout=0.01)
+
+        self.assertEqual(fake_serial.writes[0], b"D01;")
+        self.assertEqual(fake_serial.writes[-1], b"G00;")
+        self.assertEqual(result["frames"], [])
+        self.assertEqual(result["raw"], b"noise")
+
+    def test_should_start_ccd_snapshot_requires_enabled_idle_and_rate_limit(self):
+        bdwidth = load_bdwidth_module()
+
+        self.assertTrue(bdwidth.should_start_ccd_snapshot(
+            enabled=True, in_progress=False, last_capture_time=100.0,
+            now=701.0, min_interval=600.0))
+        self.assertFalse(bdwidth.should_start_ccd_snapshot(
+            enabled=False, in_progress=False, last_capture_time=100.0,
+            now=701.0, min_interval=600.0))
+        self.assertFalse(bdwidth.should_start_ccd_snapshot(
+            enabled=True, in_progress=True, last_capture_time=100.0,
+            now=701.0, min_interval=600.0))
+        self.assertFalse(bdwidth.should_start_ccd_snapshot(
+            enabled=True, in_progress=False, last_capture_time=100.0,
+            now=699.0, min_interval=600.0))
+
+    def test_is_ccd_snapshot_outlier_uses_configured_width_thresholds(self):
+        bdwidth = load_bdwidth_module()
+
+        self.assertTrue(bdwidth.is_ccd_snapshot_outlier(1.499, 1.5, 2.0))
+        self.assertFalse(bdwidth.is_ccd_snapshot_outlier(1.5, 1.5, 2.0))
+        self.assertFalse(bdwidth.is_ccd_snapshot_outlier(1.75, 1.5, 2.0))
+        self.assertFalse(bdwidth.is_ccd_snapshot_outlier(2.0, 1.5, 2.0))
+        self.assertTrue(bdwidth.is_ccd_snapshot_outlier(2.001, 1.5, 2.0))
+
+
+class FakeSerial:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.writes = []
+
+    def write(self, data):
+        self.writes.append(data)
+
+    def read(self, size):
+        if not self.chunks:
+            return b""
+        return self.chunks.pop(0)
+
+    def reset_input_buffer(self):
+        pass
+
+
+if __name__ == "__main__":
+    unittest.main()
