@@ -1,142 +1,196 @@
-# Filament monitor Sensor bdwidth
+# BDWidth Klipper Fork
 
-- Through the generated CSV file, we can intuitively see the diameter of the entire filament roll in the line chart in any position
-- Improve print quality with automatic flow rate adjustment and stability with the runout/clog feature.
+This is a fork of [`markniu/bdwidth`](https://github.com/markniu/bdwidth) with
+Klipper-side robustness and diagnostics added for USB BDWidth sensors.
 
+The hardware, firmware files, CAD, and upstream documentation remain based on
+the original project. This fork focuses on safer host behavior during long
+prints.
 
-#### bdwidth sensor is an optical width and motion sensor for 3D printer.
-I developed a unique algorithm that uses light diffraction to automatically compensate for filament shadows on the CCD sensor, even when the filament moves at different distances and angles, we still can get the right width.
+## What This Fork Changes
 
-  Just power it, then you can measure your filament motion&diameter.  
- 
+- Hardens USB frame parsing for Klipper.
+  - Accepts only the expected 5-byte width/motion frame with the newline
+    terminator in the expected position.
+  - Rejects malformed frames before they can update flow, motion, or runout
+    state.
+  - Fixes signed 16-bit motion conversion.
 
-<img  width="550"  src="https://static.wixstatic.com/media/0d0edf_54bec8b6d2c345c9acff65f798d85c5d~mv2.jpg/v1/fill/w_1374,h_802,al_c,q_85,usm_0.66_1.00_0.01/0d0edf_54bec8b6d2c345c9acff65f798d85c5d~mv2.jpg"/>
+- Adds configurable plausible-width filtering.
+  - Default discard range is `1.5mm` to `2.0mm`.
+  - Values outside that range are ignored before they update BDWidth state.
+  - This is intentionally stricter than a physical maximum filter because this
+    setup treats those readings as sensor/serial outliers.
 
-1. Flow compensation:  adjust the flow rate in real time
+- Adds CCD outlier diagnostics.
+  - On an outlier, the plugin can capture a CCD waveform from the same serial
+    connection used by Klipper.
+  - It saves `raw`, `csv`, and `json` diagnostic files immediately.
+  - During a print, PNG graph rendering is deferred to reduce host load.
+  - After printing returns to idle/ready, at most one deferred PNG is rendered.
 
-2. Jam/Runout: Pause the printer while jam or runout (laser optical tracking chip)
- 
-3. Width Accuracy: +/- 0.015mm (high resolution 0.005mm CCD sensor chip)
- 
-4. Connection: USB or I2C, Low power 5V*49mA = 0.245W
+- Prevents duplicate CSV logging handlers after reloads/restarts.
 
-5. No calibration required
+- Keeps the upstream `ENABLE_MOTION`, `ENABLE_WIDTH`, and `ENABLE_ALL` command
+  behavior.
 
-6. firmware update from the usb (Only needs updating when we release a new bdwidth.hex)
-   
-7. No mechanical contact with the filament, no wear due to the use of optical components
+## When To Use This Fork
 
-[flow adjust](https://static.wixstatic.com/media/0d0edf_dd1a7dbbf0d7433387d54fea9a8ac6f3~mv2.jpg/v1/fill/w_1486,h_753,al_c,q_85,usm_0.66_1.00_0.01/0d0edf_dd1a7dbbf0d7433387d54fea9a8ac6f3~mv2.jpg)
+Use this fork if you run BDWidth through Klipper USB mode and want defensive
+handling for occasional impossible width readings such as `0mm`, `2.2mm`, or
+hundreds of millimeters.
 
-[filament actual used](https://static.wixstatic.com/media/0d0edf_f45dd0ee38ac41dd8bb5706e1e4dc5ea~mv2.jpg/v1/fill/w_1440,h_753,al_c,q_85,usm_0.66_1.00_0.01/0d0edf_f45dd0ee38ac41dd8bb5706e1e4dc5ea~mv2.jpg)
+If your sensor is clean and stable, the original project may be enough. This
+fork is intended for printers where BDWidth data is useful but must not be
+allowed to disturb long prints when a serial or optical outlier appears.
 
-[width chart](https://static.wixstatic.com/media/0d0edf_18b3c14cc95a42f3876c291456ff140b~mv2.jpg/v1/fill/w_1330,h_753,al_c,q_85,usm_0.66_1.00_0.01/0d0edf_18b3c14cc95a42f3876c291456ff140b~mv2.jpg)
+## Installation
 
-## Quick start
-
-#### 1.Plug the bdwidth sensor into the USB port or I2C port(it can be any two gpios) on the 3D printer mainboard 
-
-
-#### 2.Install software module
-```
-cd  ~
-git clone https://github.com/markniu/bdwidth.git
-chmod 777 ~/bdwidth/klipper/install.sh
+```bash
+cd ~
+git clone https://github.com/SukbeomH/bdwidth.git
+chmod +x ~/bdwidth/klipper/install.sh
 ~/bdwidth/klipper/install.sh
 ```
 
-#### 3.Configure Klipper
+If you already installed the original project, switch the repository remote:
 
-add the following section into your klipper config file,
-
-here we connect the bdwidth to the usb port
-
+```bash
+cd ~/bdwidth
+git remote set-url origin https://github.com/SukbeomH/bdwidth.git
+git remote add upstream https://github.com/markniu/bdwidth.git 2>/dev/null || true
+git fetch origin main
+git reset --hard origin/main
 ```
+
+Then restart Klipper.
+
+## Klipper Configuration
+
+Example USB configuration:
+
+```ini
 [bdwidth fila_width_0]
-port:usb
-#   usb or i2c 
-#i2c_software_scl_pin:PA8
-#i2c_software_sda_pin:PA14
-#   needed if the port is i2c
-serial:/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
-#serial:/dev/serial/by-path/YourByPathUUID
-#   needed if the port is usb
-# note: if you also have a bd_pressure , you must use  a serial: /dev/serial/by-path method.
-# uncomment the above by-path line and replace the "YourByPathUUID" with the UUID for the bd_width. See the bd_pressure repository for instruction for bd_pressure. 
-# It's best to start with both unplugged, then use command: ls /dev/serial/by-path and take note of the UUIDs with both unplugged.
-# Repeat the command again after plugging in bd_width. Take note of the UUID for it, then again repeat for bd_pressure.
+port: usb
 
-default_nominal_filament_diameter: 1.75 # (mm)
-enable: all
-#  disable or enable the sensor after power on.
-#   the value should be one of width/motion/all/disable 
-#   width(only enable the width function)
-#   motion(only enable the motion function)
-#   all(enable both the width and motion)
-#   disable(disable both the width and motion)
+# Prefer by-path when multiple USB serial devices are present.
+serial: /dev/serial/by-path/your-bdwidth-path
+# serial: auto
+
+default_nominal_filament_diameter: 1.75
+enable: disable
+extruder: extruder
+
 min_diameter: 1.0
-#   Minimal allowed diameter for flow rate adjust and runout.
 max_diameter: 2.0
-#   Maximum allowed diameter for flow rate adjust and runout.
-#   The default is default_nominal_filament_diameter + max_difference.
-extruder:extruder
-runout_delay_length : 8.0  
-#    (mm) increase this value if the print speed is high or with high flowrate 
-#    else it may trigger the runout and pause
-flowrate_adjust_length : 5  # (mm)
-pause_on_runout: True
-sample_time:2
-#  in seconds, should be > 0.3s
-sensor_to_nozzle_length: 750
-#   The distance from sensor to the melting chamber/hot-end in
-#   millimeters (mm). The filament between the sensor and the hot-end
-#   will be treated as the default_nominal_filament_diameter. Host
-#   module works with FIFO logic. It keeps each sensor value and
-#   position in an array and POP them back in correct position. This
-#   parameter must be provided.
-#   how to measure:https://github.com/markniu/bdwidth/blob/main/doc/lengthToNozzle.jpg
 
+runout_delay_length: 8.0
+flowrate_adjust_length: 5
+pause_on_runout: False
+sample_time: 2
+sensor_to_nozzle_length: 870
 
 logging: True
-#   Out data to the file bdwidth.log.csv,
-#   the data format: date time,diameter,total used filament,raw data of total used filament. 
-#   for example:
-#   7/12 23:20:18,1.764mm,1462.5mm,62594
+debug_info: False
 
-debug_info: True
-#   Output diameter to terminal/console and klipper.log 
+# Fork-specific hard discard range.
+# Readings outside this range are not applied to BDWidth state.
+min_plausible_diameter: 1.5
+max_plausible_diameter: 2.0
 
-
-
+# Fork-specific CCD diagnostics.
+ccd_snapshot_on_outlier: True
+ccd_snapshot_min_diameter: 1.5
+ccd_snapshot_max_diameter: 2.0
+ccd_snapshot_dir: ~/printer_data/logs/bdwidth_ccd_auto
+ccd_snapshot_min_interval: 600
+ccd_snapshot_frames: 3
+ccd_snapshot_timeout: 2.0
+ccd_snapshot_defer_png_during_print: True
+ccd_snapshot_png_limit_per_print: 1
 ```
 
+### Width Ranges
 
-### 4. Gcode for bdwidth:
+There are two related ranges:
+
+- `min_diameter` / `max_diameter`: used by the existing flow/runout logic.
+- `min_plausible_diameter` / `max_plausible_diameter`: fork-specific hard
+  discard range. Values outside this range are captured for diagnostics, then
+  ignored.
+
+For this fork's default setup, both CCD diagnostic outliers and hard discard
+outliers use:
+
+```ini
+min_plausible_diameter: 1.5
+max_plausible_diameter: 2.0
+ccd_snapshot_min_diameter: 1.5
+ccd_snapshot_max_diameter: 2.0
 ```
-SET_BDWIDTH NAME=xxx COMMAND=ENABLE  ;enable the bdwidth 
-SET_BDWIDTH NAME=xxx COMMAND=DISABLE  ;disable the bdwidth 
-SET_BDWIDTH NAME=xxx COMMAND=QUERY    ;read one data from bdwidth
+
+## G-code Commands
+
+```gcode
+SET_BDWIDTH NAME=fila_width_0 COMMAND=ENABLE_ALL
+SET_BDWIDTH NAME=fila_width_0 COMMAND=ENABLE_MOTION
+SET_BDWIDTH NAME=fila_width_0 COMMAND=ENABLE_WIDTH
+SET_BDWIDTH NAME=fila_width_0 COMMAND=DISABLE
+SET_BDWIDTH NAME=fila_width_0 COMMAND=QUERY
 ```
-note: the `xxx` is the name of bdwidth in the section [bdwidth xxx]
-for example: [bdwidth fila_width_0] in the printer.cfg then we can run this command to enable it.
+
+`COMMAND=ENABLE` remains compatible and enables all functions. For setups where
+width compensation is still being validated, prefer `ENABLE_MOTION` first.
+
+## CCD Diagnostics
+
+When `ccd_snapshot_on_outlier: True` is enabled, outlier readings can create
+files under `ccd_snapshot_dir`.
+
+During a print:
+
+- `*.raw` stores the raw serial stream.
+- `*.csv` stores the decoded CCD pixel amplitudes.
+- `*.json` stores metadata such as trigger reason, width, raw width, and file
+  paths.
+- PNG rendering is skipped when
+  `ccd_snapshot_defer_png_during_print: True`.
+
+After the printer returns to idle/ready:
+
+- At most `ccd_snapshot_png_limit_per_print` deferred PNG graph is rendered.
+- The default is `1` to avoid post-print CPU spikes if many outliers occurred.
+
+To inspect a deferred diagnostic manually, open the `*.json` and matching
+`*.csv` in the snapshot directory. If `png_rendered` is `false`, the PNG was
+intentionally deferred or skipped.
+
+## Manual CCD Waveform Capture
+
+The upstream `ccd_data/ccd_data.py` tool still works, but it needs exclusive
+access to the BDWidth serial port. Klipper normally keeps that port open, so do
+not run the tool against the same port while Klipper is active.
+
+For manual offline inspection:
+
+```bash
+python3 ccd_data/ccd_data.py /dev/serial/by-path/your-bdwidth-path
 ```
-  SET_BDWIDTH NAME=fila_width_0 COMMAND=ENABLE
-```
 
-> The bdwidth is not enabled by default, we need to enable it with command, and Add the enable or disable command into the start G-code in the slicer.
-> for example:SET_BDWIDTH NAME=fila_width_0 COMMAND=ENABLE
+Stop Klipper first, then restart Klipper after the test.
 
+## Notes
 
+- Keep `debug_info: False` for long prints unless actively debugging. It can
+  generate a lot of console/log traffic.
+- `logging: True` writes the BDWidth CSV log. This fork avoids duplicate file
+  handlers after repeated reloads.
+- CCD cleaning can improve optical waveform quality, but impossible values are
+  usually handled better by frame validation and plausible-width filtering.
 
-#### [Test Video1](https://www.youtube.com/watch?v=Cj5bzoDzowE)  , [Test Video2](https://www.youtube.com/watch?v=vu5LtXh5HZw) 
-[Test Video3](https://www.tiktok.com/@plumpkatt1/video/7567149596976090381?is_from_webapp=1&sender_device=pc&web_id=7567204802599994898)
+## Upstream Project
 
-## Community & Support
- 
-| Channel | Link |
-|---|---|
-| Discord | [discord.gg/z6ahddnGVU](https://discord.gg/z6ahddnGVU) |
-| Facebook group | [facebook.com/groups/380795976169477](https://facebook.com/groups/380795976169477) |
-| Where to buy | 🇺🇸 [fabreeko.com](https://fabreeko.com) <br> 🇺🇸 [west3d.com](https://west3d.com) <br> 🌏 [pandapi3d.com](https://pandapi3d.com) <br> 🇨🇳 [淘宝](https://shop62248922.taobao.com/) <br> 🇮🇹 [mabs3d.com](https://www.mabs3d.com/en/shop/products/bd-width-sensor) <br> 🇩🇰 [3do.dk](https://3do.dk/12-abl-probe) |
+Original project and support resources:
 
-
+- Repository: <https://github.com/markniu/bdwidth>
+- Community and purchase links are maintained by the upstream project.
